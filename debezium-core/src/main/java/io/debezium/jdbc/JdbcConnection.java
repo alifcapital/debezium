@@ -1326,6 +1326,16 @@ public class JdbcConnection implements AutoCloseable {
         return column;
     }
 
+    public Integer readColumnNullable(DatabaseMetaData metadata, TableId id, String columnName) throws SQLException {
+        int nullable = metadata.columnNullableUnknown;
+        try (ResultSet rs = metadata.getColumns(id.catalog(), id.schema(), id.table(), columnName)) {
+            while (rs.next()) {
+                nullable = rs.getInt("NULLABLE");
+            }
+        }
+        return nullable;
+    }
+
     public List<String> readPrimaryKeyNames(DatabaseMetaData metadata, TableId id) throws SQLException {
         final List<String> pkColumnNames = new ArrayList<>();
         try (ResultSet rs = metadata.getPrimaryKeys(id.catalog(), id.schema(), id.table())) {
@@ -1371,6 +1381,13 @@ public class JdbcConnection implements AutoCloseable {
                         uniqueIndexColumnNames.clear();
                         continue;
                     }
+                }
+
+                // Check that column is not null
+                int colNullable = readColumnNullable(metadata, id, columnName);
+                if (colNullable == metadata.columnNullable) {
+                    excludedIndexNames.add(indexName);
+                    continue;
                 }
 
                 if (firstIndexName == null) {
