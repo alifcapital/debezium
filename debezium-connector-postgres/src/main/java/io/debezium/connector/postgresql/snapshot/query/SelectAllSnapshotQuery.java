@@ -32,6 +32,6 @@ public class SelectAllSnapshotQuery implements SnapshotQuery {
     public Optional<String> snapshotQuery(String tableId, List<String> snapshotSelectColumns) {
 
         return Optional.of(snapshotSelectColumns.stream()
-                .collect(Collectors.joining(", ", "SELECT ", " FROM " + tableId)));
+                .collect(Collectors.joining(", ", "SELECT ", " FROM ONLY " + tableId)));
     }
 }
