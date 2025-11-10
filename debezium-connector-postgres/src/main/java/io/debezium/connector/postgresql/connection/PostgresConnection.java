@@ -170,6 +170,10 @@ public class PostgresConnection extends JdbcConnection {
      * @return a {@code String} where the variables in {@code urlPattern} are replaced with values from the configuration
      */
     public String connectionString() {
+        String factory = config().getString(JdbcConfiguration.CONNECTION_FACTORY_CLASS);
+        if (factory != null) {
+            return "{" + factory + "}" + connectionString(URL_PATTERN);
+        }
         return connectionString(URL_PATTERN);
     }
 
@@ -596,7 +600,7 @@ public class PostgresConnection extends JdbcConnection {
 
     public Charset getDatabaseCharset() {
         try {
-            return Charset.forName(((BaseConnection) connection()).getEncoding().name());
+            return Charset.forName(connection().unwrap(BaseConnection.class).getEncoding().name());
         }
         catch (SQLException e) {
             throw new DebeziumException("Couldn't obtain encoding for database " + database(), e);
@@ -605,7 +609,7 @@ public class PostgresConnection extends JdbcConnection {
 
     public TimestampUtils getTimestampUtils() {
         try {
-            return ((PgConnection) this.connection()).getTimestampUtils();
+            return connection().unwrap(PgConnection.class).getTimestampUtils();
         }
         catch (SQLException e) {
             throw new DebeziumException("Couldn't get timestamp utils from underlying connection", e);
