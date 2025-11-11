@@ -166,6 +166,12 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
                         if (!publicationExists) {
                             // Close eagerly as the transaction might stay running
                             LOGGER.info("Creating new publication '{}' for plugin '{}'", publicationName, plugin);
+                            if (isOnlyRead && !PostgresConnectorConfig.AutoCreateMode.DISABLED.equals(publicationAutocreateMode)) {
+                                throw new ConnectException(String.format(
+                                        "Cannot auto-create publication '%s' for plugin '%s' on database '%s' because the server is read-only. "
+                                                + "Create the publication on the primary server or disable auto-creation.",
+                                        publicationName, plugin, database()));
+                            }
                             switch (publicationAutocreateMode) {
                                 case DISABLED:
                                     throw new ConnectException("Publication autocreation is disabled, please create one and restart the connector.");
@@ -175,12 +181,7 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
                                             : String.format("CREATE PUBLICATION %s FOR ALL TABLES;", publicationName);
                                     LOGGER.info("Creating Publication with statement '{}'", createPublicationStmt);
                                     // Publication doesn't exist, create it.
-                                    if (!isOnlyRead) {
-                                        stmt.execute(createPublicationStmt);
-                                    }
-                                    else {
-                                        LOGGER.info("The Postgres server in stand by mode, skip create statement execution");
-                                    }
+                                    stmt.execute(createPublicationStmt);
                                     break;
                                 case FILTERED:
                                     if (isOnlyRead) {
