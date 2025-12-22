@@ -358,22 +358,38 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
         }
     }
 
+    private static final long SEARCH_PROGRESS_LOG_INTERVAL_MS = 10_000;
+
     private void searchWalPosition(ChangeEventSourceContext context, PostgresPartition partition, PostgresOffsetContext offsetContext,
                                    final ReplicationStream stream, final WalPositionLocator walPosition)
             throws SQLException, InterruptedException {
         AtomicReference<Lsn> resumeLsn = new AtomicReference<>();
+        AtomicReference<Lsn> currentLsn = new AtomicReference<>();
         int noMessageIterations = 0;
+        long lastProgressLogTime = System.currentTimeMillis();
 
-        LOGGER.info("Searching for WAL resume position");
+        LOGGER.info("Searching for WAL resume position, target lastEventStoredLsn {}", walPosition.getLastEventStoredLsn());
         while (context.isRunning() && resumeLsn.get() == null) {
 
             boolean receivedMessage = stream.readPending(message -> {
                 final Lsn lsn = stream.lastReceivedLsn();
+                currentLsn.set(lsn);
                 resumeLsn.set(walPosition.resumeFromLsn(lsn, message).orElse(null));
             });
 
             if (receivedMessage) {
                 noMessageIterations = 0;
+                long now = System.currentTimeMillis();
+                if (now - lastProgressLogTime >= SEARCH_PROGRESS_LOG_INTERVAL_MS) {
+                    Lsn targetLsn = walPosition.getLastEventStoredLsn();
+                    Lsn current = currentLsn.get();
+                    if (targetLsn != null && current != null) {
+                        long remainingBytes = targetLsn.asLong() - current.asLong();
+                        LOGGER.info("Searching for WAL resume position: current {}, target {}, remaining {}",
+                                current, targetLsn, formatBytes(remainingBytes));
+                    }
+                    lastProgressLogTime = now;
+                }
             }
             else {
                 dispatcher.dispatchHeartbeatEvent(partition, offsetContext);
@@ -387,6 +403,24 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
             probeConnectionIfNeeded();
         }
         LOGGER.info("WAL resume position '{}' discovered", resumeLsn.get());
+    }
+
+    private static String formatBytes(long bytes) {
+        if (bytes < 0) {
+            return String.format("%d bytes (past target)", bytes);
+        }
+        else if (bytes < 1024) {
+            return String.format("%d bytes", bytes);
+        }
+        else if (bytes < 1024 * 1024) {
+            return String.format("%.2f KB", bytes / 1024.0);
+        }
+        else if (bytes < 1024 * 1024 * 1024) {
+            return String.format("%.2f MB", bytes / (1024.0 * 1024));
+        }
+        else {
+            return String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
+        }
     }
 
     private void probeConnectionIfNeeded() throws SQLException {

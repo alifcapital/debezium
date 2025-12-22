@@ -193,6 +193,10 @@ public class WalPositionLocator {
         return lastCommitStoredLsn;
     }
 
+    public Lsn getStartStreamingLsn() {
+        return startStreamingLsn;
+    }
+
     @Override
     public String toString() {
         return "WalPositionLocator [lastCommitStoredLsn=" + lastCommitStoredLsn + ", lastEventStoredLsn="

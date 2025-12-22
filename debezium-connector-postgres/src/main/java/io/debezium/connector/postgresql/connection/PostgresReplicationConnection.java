@@ -754,6 +754,7 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
         return new ReplicationStream() {
 
             private static final int CHECK_WARNINGS_AFTER_COUNT = 100;
+            private static final long FILTER_LOG_INTERVAL_MS = 10_000;
             private int warningCheckCounter = CHECK_WARNINGS_AFTER_COUNT;
             private ExecutorService keepAliveExecutor = null;
             private AtomicBoolean keepAliveRunning;
@@ -761,6 +762,7 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
 
             // make sure this is volatile since multiple threads may be interested in this value
             private volatile Lsn lastReceivedLsn;
+            private long lastFilterLogTime = 0;
 
             @Override
             public void read(ReplicationMessageProcessor processor) throws SQLException, InterruptedException {
@@ -786,6 +788,7 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
                 }
 
                 if (messageDecoder.shouldMessageBeSkipped(read, lastReceiveLsn, startLsn, walPosition)) {
+                    logFilteringProgress(lastReceiveLsn, walPosition);
                     return true;
                 }
 
@@ -798,6 +801,41 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
                 lastReceivedLsn = Lsn.valueOf(stream.getLastReceiveLSN());
                 LOGGER.trace("Received message at LSN {}", lastReceivedLsn);
                 messageDecoder.processMessage(buffer, processor, typeRegistry);
+            }
+
+            private void logFilteringProgress(Lsn currentLsn, WalPositionLocator walPosition) {
+                long now = System.currentTimeMillis();
+                if (now - lastFilterLogTime >= FILTER_LOG_INTERVAL_MS) {
+                    Lsn targetLsn = walPosition.getStartStreamingLsn();
+                    if (targetLsn != null && currentLsn != null) {
+                        long remainingBytes = targetLsn.asLong() - currentLsn.asLong();
+                        LOGGER.info("Filtering messages during WAL position search: current {}, target {}, remaining {}",
+                                currentLsn, targetLsn, formatBytes(remainingBytes));
+                    }
+                    else {
+                        LOGGER.info("Filtering messages during WAL position search: current {}, target {}",
+                                currentLsn, targetLsn);
+                    }
+                    lastFilterLogTime = now;
+                }
+            }
+
+            private static String formatBytes(long bytes) {
+                if (bytes < 0) {
+                    return String.format("%d bytes (past target)", bytes);
+                }
+                else if (bytes < 1024) {
+                    return String.format("%d bytes", bytes);
+                }
+                else if (bytes < 1024 * 1024) {
+                    return String.format("%.2f KB", bytes / 1024.0);
+                }
+                else if (bytes < 1024 * 1024 * 1024) {
+                    return String.format("%.2f MB", bytes / (1024.0 * 1024));
+                }
+                else {
+                    return String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
+                }
             }
 
             @Override
