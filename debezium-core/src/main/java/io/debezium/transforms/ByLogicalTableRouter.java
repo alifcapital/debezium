@@ -7,6 +7,7 @@ package io.debezium.transforms;
 
 import static org.apache.kafka.connect.transforms.util.Requirements.requireStruct;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.regex.Matcher;
@@ -146,6 +147,7 @@ public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transfo
     private Cache<Schema, Schema> envelopeSchemaUpdateCache;
     private Cache<String, String> keyRegexReplaceCache;
     private Cache<String, String> topicRegexReplaceCache;
+    private Cache<String, Boolean> topicRegexNoMatchCache;
     private SmtManager<R> smtManager;
 
     /**
@@ -210,6 +212,7 @@ public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transfo
         envelopeSchemaUpdateCache = new SynchronizedCache<>(new LRUCache<>(cacheSize));
         keyRegexReplaceCache = new SynchronizedCache<>(new LRUCache<>(cacheSize));
         topicRegexReplaceCache = new SynchronizedCache<>(new LRUCache<>(cacheSize));
+        topicRegexNoMatchCache = new SynchronizedCache<>(new LRUCache<>(cacheSize));
 
         smtManager = new SmtManager<>(config);
 
@@ -302,6 +305,13 @@ public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transfo
      * @return return the new topic name, if the regex applies. Otherwise, return null.
      */
     private String determineNewTopic(String oldTopic) {
+        // We expect most topics not to match, because each record passes every router, so we remember those topics and
+        // skip the regex for them. We keep them in their own cache, as we fear they would push the matching topics out
+        // of a shared one.
+        if (topicRegexNoMatchCache.get(oldTopic) != null) {
+            return null;
+        }
+
         String newTopic = topicRegexReplaceCache.get(oldTopic);
         if (newTopic != null) {
             return newTopic;
@@ -313,6 +323,7 @@ public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transfo
                 topicRegexReplaceCache.put(oldTopic, newTopic);
                 return newTopic;
             }
+            topicRegexNoMatchCache.put(oldTopic, Boolean.TRUE);
             return null;
         }
     }
@@ -341,7 +352,7 @@ public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transfo
     private Struct updateKey(Schema newKeySchema, Struct oldKey, String oldTopic) {
         final Struct newKey = new Struct(newKeySchema);
         for (org.apache.kafka.connect.data.Field field : oldKey.schema().fields()) {
-            newKey.put(field.name(), oldKey.get(field));
+            copyField(newKey, field, oldKey.get(field));
         }
 
         String physicalTableIdentifier = oldTopic;
@@ -403,7 +414,7 @@ public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transfo
                     && fieldValue != null) {
                 fieldValue = updateValue(newValueSchema, requireStruct(fieldValue, "Updating schema"));
             }
-            newEnvelope.put(fieldName, fieldValue);
+            copyField(newEnvelope, field, fieldValue);
         }
 
         return newEnvelope;
@@ -412,9 +423,25 @@ public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transfo
     private Struct updateValue(Schema newValueSchema, Struct oldValue) {
         final Struct newValue = new Struct(newValueSchema);
         for (org.apache.kafka.connect.data.Field field : oldValue.schema().fields()) {
-            newValue.put(field.name(), oldValue.get(field));
+            copyField(newValue, field, oldValue.get(field));
         }
         return newValue;
+    }
+
+    /**
+     * Puts the value of a field of the old struct into the same field of the new struct. We expect the new schema to
+     * list the same fields in the same order as the old one, so we take the field by its position instead of looking
+     * it up by name for every record. We fear a schema that does not line up, so we fall back to the name then.
+     */
+    private static void copyField(Struct newStruct, org.apache.kafka.connect.data.Field oldField, Object value) {
+        final List<org.apache.kafka.connect.data.Field> newFields = newStruct.schema().fields();
+        final int index = oldField.index();
+        if (index < newFields.size() && newFields.get(index).name().equals(oldField.name())) {
+            newStruct.put(newFields.get(index), value);
+        }
+        else {
+            newStruct.put(oldField.name(), value);
+        }
     }
 
     private SchemaBuilder copySchemaExcludingName(Schema source, SchemaBuilder builder) {
