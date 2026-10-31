@@ -257,6 +257,83 @@ public class PgOutputMessageDecoderTest {
         assertThat(tablesAtProcessing.get(0).columnWithName("req").isOptional()).isTrue();
     }
 
+    @Test
+    public void shouldResolveColumnTypesOncePerRelation() throws Exception {
+        final PgOutputMessageDecoder decoder = decoder(TTL);
+
+        process(decoder, relation());
+        process(decoder, insert(tuple("1", "a", "5")));
+        process(decoder, insert(tuple("2", null, "6")));
+        process(decoder, update('O', tuple("2", null, "6"), tuple("2", "b", "6")));
+        process(decoder, delete('O', tuple("2", "b", "6")));
+
+        // "int4" is the type of two columns and each column asks the registry once
+        verify(typeRegistry, times(2)).get("int4");
+        verify(typeRegistry, times(1)).get("text");
+        assertThat(processed).hasSize(4);
+        for (ReplicationMessage message : processed) {
+            final List<ReplicationMessage.Column> tuple = message.getOperation() == ReplicationMessage.Operation.DELETE
+                    ? message.getOldTupleList()
+                    : message.getNewTupleList();
+            assertThat(types(tuple)).containsExactly(INT4, TEXT, INT4);
+        }
+        assertThat(types(processed.get(2).getOldTupleList())).containsExactly(INT4, TEXT, INT4);
+    }
+
+    @Test
+    public void shouldResolveColumnTypesAgainWhenRelationMessageArrives() throws Exception {
+        final PgOutputMessageDecoder decoder = decoder(TTL);
+
+        process(decoder, relation());
+        process(decoder, insert(tuple("1", "a", "5")));
+        process(decoder, relation());
+        process(decoder, insert(tuple("2", "b", "6")));
+
+        verify(typeRegistry, times(4)).get("int4");
+        verify(typeRegistry, times(2)).get("text");
+        assertThat(types(processed.get(0).getNewTupleList())).containsExactly(INT4, TEXT, INT4);
+        assertThat(types(processed.get(1).getNewTupleList())).containsExactly(INT4, TEXT, INT4);
+    }
+
+    @Test
+    public void shouldResolveTypesOfNewColumnWhenRelationChanges() throws Exception {
+        final PgOutputMessageDecoder decoder = decoder(TTL);
+
+        process(decoder, relation());
+        process(decoder, insert(tuple("1", "a", "5")));
+        databaseColumns = new ArrayList<>(columns(false));
+        databaseColumns.add(Column.editor().name("note").optional(true).create());
+        process(decoder, relation(column("note", TEXT_OID)));
+        process(decoder, insert(tuple("2", "b", "6", "n")));
+        process(decoder, insert(tuple("3", "c", "7", "m")));
+
+        assertThat(types(processed.get(0).getNewTupleList())).containsExactly(INT4, TEXT, INT4);
+        assertThat(types(processed.get(1).getNewTupleList())).containsExactly(INT4, TEXT, INT4, TEXT);
+        assertThat(types(processed.get(2).getNewTupleList())).containsExactly(INT4, TEXT, INT4, TEXT);
+        assertThat(names(processed.get(2).getNewTupleList())).containsExactly("id", "val", "req", "note");
+        // one lookup of "text" for the first table and two for the table with the new column
+        verify(typeRegistry, times(3)).get("text");
+    }
+
+    @Test
+    public void shouldAskTypeRegistryAgainWhileTypeIsUnknown() throws Exception {
+        final PgOutputMessageDecoder decoder = decoder(TTL);
+        // The registry gives the placeholder for a type that the database does not know yet
+        when(typeRegistry.get("text")).thenReturn(PostgresType.UNKNOWN, PostgresType.UNKNOWN, TEXT);
+
+        process(decoder, relation());
+        process(decoder, insert(tuple("1", "a", "5")));
+        process(decoder, insert(tuple("2", "b", "6")));
+        process(decoder, insert(tuple("3", "c", "7")));
+        process(decoder, insert(tuple("4", "d", "8")));
+
+        assertThat(types(processed.get(0).getNewTupleList())).containsExactly(INT4, PostgresType.UNKNOWN, INT4);
+        assertThat(types(processed.get(1).getNewTupleList())).containsExactly(INT4, PostgresType.UNKNOWN, INT4);
+        assertThat(types(processed.get(2).getNewTupleList())).containsExactly(INT4, TEXT, INT4);
+        assertThat(types(processed.get(3).getNewTupleList())).containsExactly(INT4, TEXT, INT4);
+        verify(typeRegistry, times(3)).get("text");
+    }
+
     private PgOutputMessageDecoder decoder(Duration ttl) {
         final PostgresConnectorConfig config = new PostgresConnectorConfig(TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.RELATION_METADATA_CACHE_TTL_MS, ttl.toMillis())
@@ -274,6 +351,22 @@ public class PgOutputMessageDecoderTest {
     private void assertMetadataReads(int count) throws Exception {
         verify(connection, times(count)).getTableColumnsForDecoder(eq(TABLE_ID), any());
         verify(connection, times(count)).readPrimaryKeyNames(any(), eq(TABLE_ID));
+    }
+
+    private static List<PostgresType> types(List<ReplicationMessage.Column> columns) {
+        final List<PostgresType> types = new ArrayList<>();
+        for (ReplicationMessage.Column column : columns) {
+            types.add(column.getType());
+        }
+        return types;
+    }
+
+    private static List<String> names(List<ReplicationMessage.Column> columns) {
+        final List<String> names = new ArrayList<>();
+        for (ReplicationMessage.Column column : columns) {
+            names.add(column.getName());
+        }
+        return names;
     }
 
     private static List<Object> values(List<ReplicationMessage.Column> columns) {

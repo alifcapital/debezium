@@ -75,6 +75,7 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
     private final Clock clock;
     private final Duration relationMetadataCacheTtl;
     private final Map<Integer, CachedRelation> relationMetadataCache = new HashMap<>();
+    private final Map<Integer, ResolvedRelation> resolvedRelations = new HashMap<>();
 
     private Instant commitTimestamp;
 
@@ -508,6 +509,35 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
         }
     }
 
+    /**
+     * What we derive from the table of a relation once and use for every change message of the table.
+     */
+    private static final class ResolvedRelation {
+        private final Table table;
+        private final TypeRegistry typeRegistry;
+        // filled when a tuple first needs the type of the column
+        private final PostgresType[] columnTypes;
+
+        private ResolvedRelation(Table table, TypeRegistry typeRegistry) {
+            this.table = table;
+            this.typeRegistry = typeRegistry;
+            this.columnTypes = new PostgresType[table.columns().size()];
+        }
+
+        private PostgresType columnType(int index, io.debezium.relational.Column column) {
+            PostgresType type = columnTypes[index];
+            if (type == null) {
+                type = typeRegistry.get(column.typeName());
+                // The registry gives the placeholder when the database does not know the type. We fear the type can
+                // show up later, so we ask the registry again for the next tuple instead of keeping the placeholder.
+                if (type != PostgresType.UNKNOWN) {
+                    columnTypes[index] = type;
+                }
+            }
+            return type;
+        }
+    }
+
     private boolean isColumnInPrimaryKey(String schemaName, String tableName, String columnName, List<String> primaryKeyColumns) {
         // todo (DBZ-766) - Discuss this logic with team as there may be a better way to handle this
         // Personally I think its sufficient enough to resolve the PK based on the out-of-bands call
@@ -555,7 +585,7 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
         else {
             Table table = refreshTableIfRequiredColumnIsNull(relationId, resolvedTable.get(),
                     t -> tupleHasNullInRequiredColumn(buffer.duplicate(), t), typeRegistry);
-            List<Column> columns = resolveColumnsFromStreamTupleData(buffer, typeRegistry, table);
+            List<Column> columns = resolveColumnsFromStreamTupleData(buffer, resolvedRelation(relationId, table, typeRegistry));
             processor.process(new PgOutputReplicationMessage(
                     Operation.INSERT,
                     table.id().toDoubleQuotedString(),
@@ -594,16 +624,17 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             //
             // 'N' (Not-Optional) - States the following tuple-data is the new tuple.
             // This is always present.
+            final ResolvedRelation relation = resolvedRelation(relationId, table, typeRegistry);
             List<Column> oldColumns = null;
             char tupleType = (char) buffer.get();
             if ('O' == tupleType || 'K' == tupleType) {
-                oldColumns = resolveColumnsFromStreamTupleData(buffer, typeRegistry, table);
+                oldColumns = resolveColumnsFromStreamTupleData(buffer, relation);
                 // Read the 'N' tuple type
                 // This is necessary so the stream position is accurate for resolving the column tuple data
                 tupleType = (char) buffer.get();
             }
 
-            List<Column> columns = resolveColumnsFromStreamTupleData(buffer, typeRegistry, table);
+            List<Column> columns = resolveColumnsFromStreamTupleData(buffer, relation);
             processor.process(new PgOutputReplicationMessage(
                     Operation.UPDATE,
                     table.id().toDoubleQuotedString(),
@@ -638,7 +669,7 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             // A key tuple ('K') has null in every column outside the replica identity, so only an old tuple ('O') is checked.
             Table table = refreshTableIfRequiredColumnIsNull(relationId, resolvedTable.get(),
                     t -> tupleType == 'O' && tupleHasNullInRequiredColumn(buffer.duplicate(), t), typeRegistry);
-            List<Column> columns = resolveColumnsFromStreamTupleData(buffer, typeRegistry, table);
+            List<Column> columns = resolveColumnsFromStreamTupleData(buffer, resolvedRelation(relationId, table, typeRegistry));
             processor.process(new PgOutputReplicationMessage(
                     Operation.DELETE,
                     table.id().toDoubleQuotedString(),
@@ -842,14 +873,29 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
     }
 
     /**
+     * Returns what we keep for the relation while its table stays the same.
+     * The decoder gets a new table object when the relation or the schema changes, and then we start over.
+     */
+    private ResolvedRelation resolvedRelation(int relationId, Table table, TypeRegistry typeRegistry) {
+        ResolvedRelation relation = resolvedRelations.get(relationId);
+        if (relation == null || relation.table != table || relation.typeRegistry != typeRegistry) {
+            relation = new ResolvedRelation(table, typeRegistry);
+            resolvedRelations.put(relationId, relation);
+        }
+        return relation;
+    }
+
+    /**
      * Resolve the replication stream's tuple data to a list of replication message columns.
      *
      * @param buffer The replication stream buffer
-     * @param typeRegistry The database type registry
-     * @param table The database table
+     * @param relation The relation of the tuple, with its table and the database type registry
      * @return list of replication message columns
      */
-    private static List<Column> resolveColumnsFromStreamTupleData(ByteBuffer buffer, TypeRegistry typeRegistry, Table table) {
+    private static List<Column> resolveColumnsFromStreamTupleData(ByteBuffer buffer, ResolvedRelation relation) {
+        final Table table = relation.table;
+        final TypeRegistry typeRegistry = relation.typeRegistry;
+
         // Read number of the columns
         short numberOfColumns = buffer.getShort();
 
@@ -862,8 +908,7 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
 
             final io.debezium.relational.Column column = table.columns().get(i);
             final String columnName = column.name();
-            final String typeName = column.typeName();
-            final PostgresType columnType = typeRegistry.get(typeName);
+            final PostgresType columnType = relation.columnType(i, column);
             final String typeExpression = column.typeExpression();
             final boolean optional = column.isOptional();
 
