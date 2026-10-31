@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import org.junit.Test;
 
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.ConfigDefinitionMetadataTest;
 import io.debezium.config.Configuration;
 
@@ -52,5 +53,31 @@ public class PostgresConnectorConfigDefTest extends ConfigDefinitionMetadataTest
                 configBuilder.build(), PostgresConnectorConfig.REPLICA_IDENTITY_AUTOSET_VALUES, (field, value, problemMessage) -> System.out.println(problemMessage));
 
         assertThat((problemCount == 0)).isTrue();
+    }
+
+    @Test
+    public void shouldNotIncludeUnknownDatatypesByDefault() {
+        assertThat(configWithUnknownDatatypes(null).includeUnknownDatatypes()).isFalse();
+    }
+
+    @Test
+    public void shouldIncludeUnknownDatatypesWhenEnabled() {
+        assertThat(configWithUnknownDatatypes("true").includeUnknownDatatypes()).isTrue();
+        assertThat(configWithUnknownDatatypes(" TRUE ").includeUnknownDatatypes()).isTrue();
+    }
+
+    @Test
+    public void shouldNotIncludeUnknownDatatypesWhenDisabled() {
+        assertThat(configWithUnknownDatatypes("false").includeUnknownDatatypes()).isFalse();
+    }
+
+    private static PostgresConnectorConfig configWithUnknownDatatypes(String value) {
+        final Configuration.Builder builder = Configuration.create()
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "serverX")
+                .with(PostgresConnectorConfig.DATABASE_NAME, "serverX");
+        if (value != null) {
+            builder.with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, value);
+        }
+        return new PostgresConnectorConfig(builder.build());
     }
 }

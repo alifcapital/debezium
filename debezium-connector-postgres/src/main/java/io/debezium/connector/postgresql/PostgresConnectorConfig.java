@@ -1211,6 +1211,7 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
     private final SnapshotLockingMode snapshotLockingMode;
     private final boolean readOnlyConnection;
     private final boolean publishViaPartitionRoot;
+    private final boolean includeUnknownDatatypes;
 
     public PostgresConnectorConfig(Configuration config) {
         super(
@@ -1235,6 +1236,7 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         this.snapshotLockingMode = SnapshotLockingMode.parse(config.getString(SNAPSHOT_LOCKING_MODE), SNAPSHOT_LOCKING_MODE.defaultValueAsString());
         this.readOnlyConnection = config.getBoolean(READ_ONLY_CONNECTION);
         this.publishViaPartitionRoot = config.getBoolean(PUBLISH_VIA_PARTITION_ROOT);
+        this.includeUnknownDatatypes = config.getBoolean(INCLUDE_UNKNOWN_DATATYPES);
         this.lsnFlushTimeoutAction = LsnFlushTimeoutAction.parse(config.getString(LSN_FLUSH_TIMEOUT_ACTION));
     }
 
@@ -1323,7 +1325,7 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
     }
 
     protected boolean includeUnknownDatatypes() {
-        return getConfig().getBoolean(INCLUDE_UNKNOWN_DATATYPES);
+        return includeUnknownDatatypes;
     }
 
     public Map<String, ConfigValue> validate() {
