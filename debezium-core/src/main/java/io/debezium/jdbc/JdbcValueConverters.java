@@ -1409,12 +1409,19 @@ public class JdbcValueConverters implements ValueConverterProvider {
             final Object schemaDefault = fieldDefn.schema().defaultValue();
             return schemaDefault != null ? schemaDefault : fallback;
         }
-        logger.trace("Value from data object: *** {} ***", maybeRedactSensitiveData(data));
+        // We run this for every value of every row and each level check walks the logger hierarchy,
+        // so we check the level once here instead of once for each trace message and each redaction.
+        final boolean traceEnabled = logger.isTraceEnabled();
+        if (traceEnabled) {
+            logger.trace("Value from data object: *** {} ***", maybeRedactSensitiveData(data));
+        }
 
         final ResultReceiver r = ResultReceiver.create();
         callback.convert(r);
-        logger.trace("Callback is: {}", callback);
-        logger.trace("Value from ResultReceiver: {}", maybeRedactSensitiveData(r));
+        if (traceEnabled) {
+            logger.trace("Callback is: {}", callback);
+            logger.trace("Value from ResultReceiver: {}", maybeRedactSensitiveData(r));
+        }
         return r.hasReceived() ? r.get() : handleUnknownData(column, fieldDefn, data);
     }
 

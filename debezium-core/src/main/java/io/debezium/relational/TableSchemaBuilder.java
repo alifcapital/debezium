@@ -315,6 +315,9 @@ public class TableSchemaBuilder {
             ValueConverter[] converters = convertersForColumns(schema, tableId, columnsThatShouldBeAdded, mappers);
             return (row) -> {
                 Struct result = new Struct(schema);
+                // We run this for every row and the level check walks the logger hierarchy,
+                // so we check the level once per row instead of once per column.
+                final boolean traceEnabled = LOGGER.isTraceEnabled();
                 for (int i = 0; i != numFields; ++i) {
                     validateIncomingRowToInternalMetadata(tableId, recordIndexes, fields, converters, row, i);
                     Object value = row[recordIndexes[i]];
@@ -322,7 +325,9 @@ public class TableSchemaBuilder {
                     ValueConverter converter = converters[i];
 
                     if (converter != null) {
-                        LOGGER.trace("converter for value object: *** {} ***", converter);
+                        if (traceEnabled) {
+                            LOGGER.trace("converter for value object: *** {} ***", converter);
+                        }
                         try {
                             value = converter.convert(value);
                             result.put(fields[i], value);
@@ -352,7 +357,7 @@ public class TableSchemaBuilder {
                             }
                         }
                     }
-                    else {
+                    else if (traceEnabled) {
                         LOGGER.trace("converter is null...");
                     }
                 }

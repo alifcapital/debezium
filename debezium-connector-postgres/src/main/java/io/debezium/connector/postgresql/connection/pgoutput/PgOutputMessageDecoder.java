@@ -853,6 +853,10 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
         // Read number of the columns
         short numberOfColumns = buffer.getShort();
 
+        // We run this for every column of every change message and the level check walks the logger hierarchy,
+        // so we check the level once per tuple instead of once per column.
+        final boolean traceEnabled = LOGGER.isTraceEnabled();
+
         List<Column> columns = new ArrayList<>(numberOfColumns);
         for (short i = 0; i < numberOfColumns; ++i) {
 
@@ -903,12 +907,16 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             }
             else {
                 replicationMessageColumn = null;
-                LOGGER.trace("Unsupported type '{}' for column: '{}'", type, column);
+                if (traceEnabled) {
+                    LOGGER.trace("Unsupported type '{}' for column: '{}'", type, column);
+                }
             }
 
             if (replicationMessageColumn != null) {
                 columns.add(replicationMessageColumn);
-                LOGGER.trace("Column: {}", replicationMessageColumn);
+                if (traceEnabled) {
+                    LOGGER.trace("Column: {}", replicationMessageColumn);
+                }
             }
         }
 
