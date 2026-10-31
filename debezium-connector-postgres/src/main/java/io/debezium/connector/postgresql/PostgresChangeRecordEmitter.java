@@ -173,12 +173,13 @@ public class PostgresChangeRecordEmitter extends RelationalChangeRecordEmitter<P
         Object[] values = new Object[columnsWithoutToasted.size() < schemaColumns.size() ? schemaColumns.size() : columnsWithoutToasted.size()];
 
         final Set<String> undeliveredToastableColumns = new HashSet<>(schema.getToastableColumnsForTableId(table.id()));
+        int columnIndex = 0;
         for (ReplicationMessage.Column column : columns) {
             // DBZ-298 Quoted column names will be sent like that in messages, but stored unquoted in the column names
             final String columnName = Strings.unquoteIdentifierPart(column.getName());
             undeliveredToastableColumns.remove(columnName);
 
-            int position = getPosition(columnName, table, values);
+            int position = getPosition(columnName, columnIndex++, table, values);
             if (position != -1) {
                 Object value = column.getValue(() -> connection.connection().unwrap(BaseConnection.class), connectorConfig.includeUnknownDatatypes());
                 if (sourceOfToasted) {
@@ -209,8 +210,15 @@ public class PostgresChangeRecordEmitter extends RelationalChangeRecordEmitter<P
         return values;
     }
 
-    private int getPosition(String columnName, Table table, Object[] values) {
-        final Column tableColumn = table.columnWithName(columnName);
+    private int getPosition(String columnName, int columnIndex, Table table, Object[] values) {
+        // We expect the message to list the columns in the order of the table, so we try the table column at the same
+        // index first. The lookup by name lowercases the name and we would pay for it on every column of every event.
+        // A table keeps one column for each lowercase name, so a column with the same name is the one the lookup finds.
+        final List<Column> tableColumns = table.columns();
+        Column tableColumn = columnIndex < tableColumns.size() ? tableColumns.get(columnIndex) : null;
+        if (tableColumn == null || !tableColumn.name().equals(columnName)) {
+            tableColumn = table.columnWithName(columnName);
+        }
 
         if (tableColumn == null) {
             LOGGER.warn(
