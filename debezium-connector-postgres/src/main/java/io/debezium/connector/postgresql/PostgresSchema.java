@@ -234,7 +234,14 @@ public class PostgresSchema extends RelationalDatabaseSchema {
         tableIdToToastableColumns.put(tableId, Collections.unmodifiableList(toastableColumns));
     }
 
-    protected static TableId parse(String table) {
+    /**
+     * Parses a table name the way the streaming source does for a replication message, using the public schema
+     * when the name has none.
+     *
+     * @param table the table name as in {@link io.debezium.connector.postgresql.connection.ReplicationMessage#getTable()}
+     * @return the table id
+     */
+    public static TableId parse(String table) {
         TableId tableId = TableId.parse(table, false);
         if (tableId == null) {
             return null;

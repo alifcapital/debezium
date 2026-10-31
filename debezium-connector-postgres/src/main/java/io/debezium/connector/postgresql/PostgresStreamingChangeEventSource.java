@@ -343,7 +343,10 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
         else {
             TableId tableId = null;
             if (!message.isSkippedMessage()) {
-                tableId = PostgresSchema.parse(message.getTable());
+                tableId = message.getTableId();
+                if (tableId == null) {
+                    tableId = PostgresSchema.parse(message.getTable());
+                }
                 Objects.requireNonNull(tableId);
             }
 

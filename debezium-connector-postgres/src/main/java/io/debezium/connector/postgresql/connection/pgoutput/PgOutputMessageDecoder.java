@@ -32,6 +32,7 @@ import org.postgresql.replication.fluent.logical.ChainedLogicalStreamBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.connector.postgresql.PostgresSchema;
 import io.debezium.connector.postgresql.PostgresStreamingChangeEventSource.PgConnectionSupplier;
 import io.debezium.connector.postgresql.PostgresType;
 import io.debezium.connector.postgresql.TypeRegistry;
@@ -517,11 +518,30 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
         private final TypeRegistry typeRegistry;
         // filled when a tuple first needs the type of the column
         private final PostgresType[] columnTypes;
+        private final String tableName;
+        private final TableId tableId;
 
         private ResolvedRelation(Table table, TypeRegistry typeRegistry) {
             this.table = table;
             this.typeRegistry = typeRegistry;
             this.columnTypes = new PostgresType[table.columns().size()];
+            this.tableName = table.id().toDoubleQuotedString();
+            this.tableId = parseTableName(tableName);
+        }
+
+        /**
+         * Parses the name the way the streaming source does, so that it can take the identifier from the message
+         * instead of parsing the name again for every change.
+         */
+        private static TableId parseTableName(String tableName) {
+            try {
+                return PostgresSchema.parse(tableName);
+            }
+            catch (RuntimeException e) {
+                // We fear a name that cannot be parsed back. We leave the identifier empty, so that the streaming
+                // source parses the name itself and fails on it as it would on the name in any other message.
+                return null;
+            }
         }
 
         private PostgresType columnType(int index, io.debezium.relational.Column column) {
@@ -585,10 +605,12 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
         else {
             Table table = refreshTableIfRequiredColumnIsNull(relationId, resolvedTable.get(),
                     t -> tupleHasNullInRequiredColumn(buffer.duplicate(), t), typeRegistry);
-            List<Column> columns = resolveColumnsFromStreamTupleData(buffer, resolvedRelation(relationId, table, typeRegistry));
+            final ResolvedRelation relation = resolvedRelation(relationId, table, typeRegistry);
+            List<Column> columns = resolveColumnsFromStreamTupleData(buffer, relation);
             processor.process(new PgOutputReplicationMessage(
                     Operation.INSERT,
-                    table.id().toDoubleQuotedString(),
+                    relation.tableName,
+                    relation.tableId,
                     commitTimestamp,
                     transactionId,
                     null,
@@ -637,7 +659,8 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             List<Column> columns = resolveColumnsFromStreamTupleData(buffer, relation);
             processor.process(new PgOutputReplicationMessage(
                     Operation.UPDATE,
-                    table.id().toDoubleQuotedString(),
+                    relation.tableName,
+                    relation.tableId,
                     commitTimestamp,
                     transactionId,
                     oldColumns,
@@ -669,10 +692,12 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             // A key tuple ('K') has null in every column outside the replica identity, so only an old tuple ('O') is checked.
             Table table = refreshTableIfRequiredColumnIsNull(relationId, resolvedTable.get(),
                     t -> tupleType == 'O' && tupleHasNullInRequiredColumn(buffer.duplicate(), t), typeRegistry);
-            List<Column> columns = resolveColumnsFromStreamTupleData(buffer, resolvedRelation(relationId, table, typeRegistry));
+            final ResolvedRelation relation = resolvedRelation(relationId, table, typeRegistry);
+            List<Column> columns = resolveColumnsFromStreamTupleData(buffer, relation);
             processor.process(new PgOutputReplicationMessage(
                     Operation.DELETE,
-                    table.id().toDoubleQuotedString(),
+                    relation.tableName,
+                    relation.tableId,
                     commitTimestamp,
                     transactionId,
                     columns,
@@ -709,23 +734,24 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             relationIds[i] = buffer.getInt();
         }
 
-        List<Table> tables = new ArrayList<>();
+        List<ResolvedRelation> relations = new ArrayList<>();
         for (int relationId : relationIds) {
             Optional<Table> resolvedTable = resolveRelation(relationId);
-            resolvedTable.ifPresent(tables::add);
+            resolvedTable.ifPresent(table -> relations.add(resolvedRelation(relationId, table, typeRegistry)));
         }
 
         if (LOGGER.isTraceEnabled()) {
             LOGGER.trace("Event: {}, RelationIds: {}, OptionBits: {}", MessageType.TRUNCATE, Arrays.toString(relationIds), optionBits);
         }
 
-        int noOfResolvedTables = tables.size();
+        int noOfResolvedTables = relations.size();
         for (int i = 0; i < noOfResolvedTables; i++) {
-            Table table = tables.get(i);
+            ResolvedRelation relation = relations.get(i);
             boolean lastTableInTruncate = (i + 1) == noOfResolvedTables;
             processor.process(new PgOutputTruncateReplicationMessage(
                     Operation.TRUNCATE,
-                    table.id().toDoubleQuotedString(),
+                    relation.tableName,
+                    relation.tableId,
                     commitTimestamp,
                     transactionId,
                     lastTableInTruncate));

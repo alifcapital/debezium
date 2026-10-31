@@ -8,13 +8,20 @@ package io.debezium.connector.postgresql.connection.pgoutput;
 
 import java.time.Instant;
 
+import io.debezium.relational.TableId;
+
 public class PgOutputTruncateReplicationMessage extends PgOutputReplicationMessage {
 
     private final boolean lastTableInTruncate;
 
     public PgOutputTruncateReplicationMessage(Operation op, String table, Instant commitTimestamp, long transactionId,
                                               boolean lastTableInTruncate) {
-        super(op, table, commitTimestamp, transactionId, null, null);
+        this(op, table, null, commitTimestamp, transactionId, lastTableInTruncate);
+    }
+
+    public PgOutputTruncateReplicationMessage(Operation op, String table, TableId tableId, Instant commitTimestamp, long transactionId,
+                                              boolean lastTableInTruncate) {
+        super(op, table, tableId, commitTimestamp, transactionId, null, null);
         this.lastTableInTruncate = lastTableInTruncate;
     }
 

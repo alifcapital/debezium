@@ -24,6 +24,7 @@ import io.debezium.connector.postgresql.PostgresStreamingChangeEventSource;
 import io.debezium.connector.postgresql.PostgresStreamingChangeEventSource.PgConnectionSupplier;
 import io.debezium.connector.postgresql.PostgresType;
 import io.debezium.connector.postgresql.TypeRegistry;
+import io.debezium.relational.TableId;
 
 /**
  * An abstract representation of a replication message that is sent by a PostgreSQL logical decoding plugin and
@@ -155,6 +156,14 @@ public interface ReplicationMessage {
      * @return Table changed
      */
     String getTable();
+
+    /**
+     * @return the identifier of the table changed, or {@code null} if the message only carries the table name from
+     *         {@link #getTable()}; the identifier is the same as the one that parsing the table name gives
+     */
+    default TableId getTableId() {
+        return null;
+    }
 
     /**
      * @return Set of original values of table columns, null for INSERT

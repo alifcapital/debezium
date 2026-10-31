@@ -6,6 +6,7 @@
 package io.debezium.connector.postgresql.connection.pgoutput;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
@@ -33,6 +34,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.Before;
 import org.junit.Test;
 
+import io.debezium.config.CommonConnectorConfig;
+import io.debezium.config.Configuration;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.PostgresSchema;
 import io.debezium.connector.postgresql.PostgresType;
@@ -334,10 +337,191 @@ public class PgOutputMessageDecoderTest {
         verify(typeRegistry, times(3)).get("text");
     }
 
+    @Test
+    public void shouldCarryTableIdOfRelationInChangeMessages() throws Exception {
+        final PgOutputMessageDecoder decoder = decoder(TTL, "none");
+
+        process(decoder, begin());
+        process(decoder, relation());
+        process(decoder, insert(tuple("1", "a", "5")));
+        process(decoder, update('O', tuple("1", "a", "5"), tuple("1", "b", "5")));
+        process(decoder, delete('O', tuple("1", "b", "5")));
+        process(decoder, truncate());
+
+        final List<ReplicationMessage> changes = changes();
+        assertThat(changes).extracting(ReplicationMessage::getOperation).containsExactly(
+                ReplicationMessage.Operation.INSERT,
+                ReplicationMessage.Operation.UPDATE,
+                ReplicationMessage.Operation.DELETE,
+                ReplicationMessage.Operation.TRUNCATE);
+        for (ReplicationMessage message : changes) {
+            assertThat(message.getTable()).isEqualTo("\"public\".\"orders\"");
+            assertSameTableId(message.getTableId(), PostgresSchema.parse(message.getTable()));
+            assertSameTableId(message.getTableId(), TABLE_ID);
+        }
+    }
+
+    @Test
+    public void shouldKeepTheTableIdWhileTheTableStaysTheSame() throws Exception {
+        final PgOutputMessageDecoder decoder = decoder(TTL);
+
+        process(decoder, relation());
+        process(decoder, insert(tuple("1", "a", "5")));
+        process(decoder, insert(tuple("2", "b", "6")));
+
+        assertThat(processed.get(0).getTableId()).isNotNull().isSameAs(processed.get(1).getTableId());
+        assertThat(processed.get(0).getTable()).isEqualTo(processed.get(1).getTable());
+    }
+
+    @Test
+    public void shouldCarryTableIdOfTheRenamedTable() throws Exception {
+        final PgOutputMessageDecoder decoder = decoder(TTL);
+        mockMetadataOfAnyTable();
+
+        process(decoder, relation());
+        process(decoder, insert(tuple("1", "a", "5")));
+        process(decoder, relation(new TableId(null, "archive", "orders_2024")));
+        process(decoder, insert(tuple("2", "b", "6")));
+
+        assertThat(processed.get(0).getTable()).isEqualTo("\"public\".\"orders\"");
+        assertSameTableId(processed.get(0).getTableId(), new TableId(null, "public", "orders"));
+        assertThat(processed.get(1).getTable()).isEqualTo("\"archive\".\"orders_2024\"");
+        assertSameTableId(processed.get(1).getTableId(), new TableId(null, "archive", "orders_2024"));
+    }
+
+    @Test
+    public void shouldCarryTableIdThatEqualsTheParsedTableNameForNamesThatSurviveQuoting() throws Exception {
+        mockMetadataOfAnyTable();
+
+        final String[][] names = {
+                { "public", "orders" },
+                { "public", "Orders" },
+                { "MySchema", "MyTable" },
+                { "my.schema", "my.table" },
+                { "public", "dotted.name.with.three.parts" },
+                { "public", "with\"double\"quotes" },
+                { "public", "with'single'quote" },
+                { "public", "with`backtick" },
+                { "public", " leading and trailing spaces " },
+                { "public", "tab\tinside" },
+                { "public", "UPPER_CASE_ONLY" },
+                { "public", "$dollar" },
+                { "public", "(parentheses)" },
+                { "public", "[brackets]" },
+        };
+        for (String[] name : names) {
+            final TableId original = new TableId(null, name[0], name[1]);
+
+            final ReplicationMessage message = decodeInsertInto(original);
+
+            assertThat(message.getTable()).as("table name of %s", original).isEqualTo(original.toDoubleQuotedString());
+            assertThat(message.getTableId()).as("table id of %s", original).isNotNull();
+            assertSameTableId(message.getTableId(), PostgresSchema.parse(message.getTable()));
+            // The name survives quoting, so the table id is also the one the decoder has
+            assertSameTableId(message.getTableId(), original);
+        }
+    }
+
+    @Test
+    public void shouldCarryTableIdThatEqualsTheParsedTableNameForNamesThatChangeWhenParsed() throws Exception {
+        mockMetadataOfAnyTable();
+
+        final String[][] names = {
+                // a name that starts and ends with a double quote is not quoted again, so the quotes are lost
+                { "public", "\"quoted\"" },
+                // two single quotes or two backticks in a row become one
+                { "public", "two''single" },
+                { "public", "two``backticks" },
+                // pgoutput sends an empty schema for the system catalog, and a name without schema gets the public schema
+                { "", "no_schema" },
+        };
+        for (String[] name : names) {
+            final TableId original = new TableId(null, name[0], name[1]);
+
+            final ReplicationMessage message = decodeInsertInto(original);
+
+            assertThat(message.getTable()).as("table name of %s", original).isEqualTo(original.toDoubleQuotedString());
+            assertThat(message.getTableId()).as("table id of %s", original).isNotNull();
+            assertSameTableId(message.getTableId(), PostgresSchema.parse(message.getTable()));
+            // The id is what parsing the name gives and not the id of the decoder, because these two differ here
+            assertThat(message.getTableId()).as("table id of %s", original).isNotEqualTo(original);
+        }
+    }
+
+    @Test
+    public void shouldCarryTableIdThatEqualsTheParsedTableNameForNonAsciiNames() throws Exception {
+        mockMetadataOfAnyTable();
+
+        // The decoder reads the bytes of the name as characters, and we only expect it to carry what it makes of the name
+        final ReplicationMessage message = decodeInsertInto(new TableId(null, "public", "unicode_\u0442\u0430\u0431\u043b\u0438\u0446\u0430"));
+
+        assertThat(message.getTable()).startsWith("\"public\".\"unicode_");
+        assertSameTableId(message.getTableId(), PostgresSchema.parse(message.getTable()));
+    }
+
+    @Test
+    public void shouldLeaveTableIdEmptyForNameThatCannotBeParsed() throws Exception {
+        mockMetadataOfAnyTable();
+
+        // A name that starts or ends with a double quote is not quoted again, and these cannot be read back
+        for (String tableName : new String[]{ "\"not closed", "ends with quote\"", "\"two\" \"parts\"" }) {
+            final TableId original = new TableId(null, "public", tableName);
+
+            final ReplicationMessage message = decodeInsertInto(original);
+
+            // The streaming source parses the name when the message has no table id, and fails the way it always did
+            assertThat(message.getTableId()).as("table id of %s", original).isNull();
+            assertThat(message.getTable()).isEqualTo(original.toDoubleQuotedString());
+            assertThatThrownBy(() -> PostgresSchema.parse(message.getTable())).isInstanceOf(RuntimeException.class);
+        }
+    }
+
+    private ReplicationMessage decodeInsertInto(TableId tableId) throws Exception {
+        final PgOutputMessageDecoder decoder = decoder(TTL);
+        processed.clear();
+        process(decoder, relation(tableId));
+        process(decoder, insert(tuple("1", "a", "5")));
+        assertThat(processed).hasSize(1);
+        return processed.get(0);
+    }
+
+    /**
+     * The metadata queries of the mocked connection answer for any table.
+     */
+    private void mockMetadataOfAnyTable() throws Exception {
+        when(connection.getTableColumnsForDecoder(any(), any())).thenAnswer(invocation -> databaseColumns);
+        when(connection.readPrimaryKeyNames(any(), any())).thenAnswer(invocation -> new ArrayList<>(List.of("id")));
+    }
+
+    private List<ReplicationMessage> changes() {
+        final List<ReplicationMessage> changes = new ArrayList<>();
+        for (ReplicationMessage message : processed) {
+            if (!message.isTransactionalMessage()) {
+                changes.add(message);
+            }
+        }
+        return changes;
+    }
+
+    private static void assertSameTableId(TableId actual, TableId expected) {
+        assertThat(actual).isNotNull();
+        assertThat(actual.catalog()).isEqualTo(expected.catalog());
+        assertThat(actual.schema()).isEqualTo(expected.schema());
+        assertThat(actual.table()).isEqualTo(expected.table());
+        assertThat(actual).isEqualTo(expected);
+    }
+
     private PgOutputMessageDecoder decoder(Duration ttl) {
-        final PostgresConnectorConfig config = new PostgresConnectorConfig(TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.RELATION_METADATA_CACHE_TTL_MS, ttl.toMillis())
-                .build());
+        return decoder(ttl, null);
+    }
+
+    private PgOutputMessageDecoder decoder(Duration ttl, String skippedOperations) {
+        final Configuration.Builder configuration = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.RELATION_METADATA_CACHE_TTL_MS, ttl.toMillis());
+        if (skippedOperations != null) {
+            configuration.with(CommonConnectorConfig.SKIPPED_OPERATIONS, skippedOperations);
+        }
+        final PostgresConnectorConfig config = new PostgresConnectorConfig(configuration.build());
         return new PgOutputMessageDecoder(new MessageDecoderContext(config, schema), connection, now::get);
     }
 
@@ -393,12 +577,19 @@ public class PgOutputMessageDecoderTest {
      * Relation message for public.orders(id int4 key, val text, req int4) followed by the extra columns.
      */
     private static ByteBuffer relation(Object[]... extraColumns) throws IOException {
+        return relation(TABLE_ID, extraColumns);
+    }
+
+    /**
+     * Relation message for the given table with the same columns as {@link #relation(Object[]...)}.
+     */
+    private static ByteBuffer relation(TableId tableId, Object[]... extraColumns) throws IOException {
         final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         final DataOutputStream out = new DataOutputStream(bytes);
         out.writeByte('R');
         out.writeInt(RELATION_ID);
-        writeString(out, TABLE_ID.schema());
-        writeString(out, TABLE_ID.table());
+        writeString(out, tableId.schema());
+        writeString(out, tableId.table());
         out.writeByte('d');
         out.writeShort(3 + extraColumns.length);
         writeRelationColumn(out, KEY_FLAG, "id", INT4_OID);
@@ -415,6 +606,26 @@ public class PgOutputMessageDecoderTest {
         writeString(out, name);
         out.writeInt(typeOid);
         out.writeInt(TypeRegistry.NO_TYPE_MODIFIER);
+    }
+
+    private static ByteBuffer begin() throws IOException {
+        final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        final DataOutputStream out = new DataOutputStream(bytes);
+        out.writeByte('B');
+        out.writeLong(1L); // final LSN of the transaction
+        out.writeLong(0L); // commit timestamp
+        out.writeInt(700); // transaction id
+        return ByteBuffer.wrap(bytes.toByteArray());
+    }
+
+    private static ByteBuffer truncate() throws IOException {
+        final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        final DataOutputStream out = new DataOutputStream(bytes);
+        out.writeByte('T');
+        out.writeInt(1); // number of relations
+        out.writeByte(0); // options
+        out.writeInt(RELATION_ID);
+        return ByteBuffer.wrap(bytes.toByteArray());
     }
 
     private static ByteBuffer insert(byte[] newTuple) throws IOException {
