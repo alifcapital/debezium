@@ -1005,6 +1005,24 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "lsn.flush.timeout.action will be taken. Defaults to 30 seconds.")
             .withValidation(Field::isPositiveInteger);
 
+    public static final Field RELATION_METADATA_CACHE_TTL_MS = Field.create("relation.metadata.cache.ttl.ms")
+            .withDisplayName("Relation metadata cache TTL (ms)")
+            .withType(Type.LONG)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_REPLICATION, 14))
+            .withDefault(0L)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.LOW)
+            .withDescription("Used only with the pgoutput plugin. The server sends a relation message for a table again "
+                    + "after each invalidation of that table, for example after VACUUM or ANALYZE. For each relation message "
+                    + "the connector reads column optionality, column defaults and key columns from the database. "
+                    + "When this value is greater than 0, the connector keeps these results for the given time and uses them "
+                    + "for a relation message that is equal to the cached one, without a database query. "
+                    + "A change of NOT NULL, of a default or of key columns that does not change the relation message is "
+                    + "applied when the cache entry expires. A null value in a column that the cache marks as required makes "
+                    + "the connector read the metadata from the database before it emits the event. "
+                    + "0 (the default) disables the cache.")
+            .withValidation(Field::isNonNegativeLong);
+
     /**
      * The set of predefined LSN flush timeout action options
      */
@@ -1288,6 +1306,10 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         return lsnFlushTimeoutAction;
     }
 
+    public Duration relationMetadataCacheTtl() {
+        return Duration.ofMillis(getConfig().getLong(PostgresConnectorConfig.RELATION_METADATA_CACHE_TTL_MS));
+    }
+
     public LogicalDecodingMessageFilter getMessageFilter() {
         return logicalDecodingMessageFilter;
     }
@@ -1397,6 +1419,7 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
                     STATUS_UPDATE_INTERVAL_MS,
                     LSN_FLUSH_TIMEOUT_MS,
                     LSN_FLUSH_TIMEOUT_ACTION,
+                    RELATION_METADATA_CACHE_TTL_MS,
                     TCP_KEEPALIVE,
                     XMIN_FETCH_INTERVAL,
                     // Use this connector's implementation rather than common connector's flavor

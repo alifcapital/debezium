@@ -11,6 +11,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.sql.DatabaseMetaData;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
@@ -18,12 +19,14 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 import org.postgresql.replication.fluent.logical.ChainedLogicalStreamBuilder;
 import org.slf4j.Logger;
@@ -49,6 +52,7 @@ import io.debezium.data.Envelope;
 import io.debezium.relational.ColumnEditor;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
+import io.debezium.util.Clock;
 import io.debezium.util.HexConverter;
 import io.debezium.util.Strings;
 
@@ -68,6 +72,9 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
 
     private final MessageDecoderContext decoderContext;
     private final PostgresConnection connection;
+    private final Clock clock;
+    private final Duration relationMetadataCacheTtl;
+    private final Map<Integer, CachedRelation> relationMetadataCache = new HashMap<>();
 
     private Instant commitTimestamp;
 
@@ -117,8 +124,14 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
     }
 
     public PgOutputMessageDecoder(MessageDecoderContext decoderContext, PostgresConnection connection) {
+        this(decoderContext, connection, Clock.system());
+    }
+
+    PgOutputMessageDecoder(MessageDecoderContext decoderContext, PostgresConnection connection, Clock clock) {
         this.decoderContext = decoderContext;
         this.connection = connection;
+        this.clock = clock;
+        this.relationMetadataCacheTtl = decoderContext.getConfig().relationMetadataCacheTtl();
     }
 
     @Override
@@ -286,6 +299,21 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
      * @param typeRegistry The postgres type registry
      */
     private void handleRelationMessage(ByteBuffer buffer, TypeRegistry typeRegistry) throws SQLException {
+        applyRelation(buffer, typeRegistry, true);
+    }
+
+    /**
+     * Builds the table of a relation message and applies it to the schema.
+     *
+     * @param buffer The relation message, positioned at the relation id
+     * @param typeRegistry The postgres type registry
+     * @param useCachedMetadata {@code false} to read the column metadata from the database even when the cache has it
+     */
+    private void applyRelation(ByteBuffer buffer, TypeRegistry typeRegistry, boolean useCachedMetadata) throws SQLException {
+        // The message body is the cache key: if any of its bytes differ, the cached metadata does not apply.
+        final byte[] relationDefinition = new byte[buffer.remaining()];
+        buffer.duplicate().get(relationDefinition);
+
         int relationId = buffer.getInt();
         String schemaName = readString(buffer);
         String tableName = readString(buffer);
@@ -295,26 +323,11 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
         LOGGER.trace("Event: {}, RelationId: {}, Replica Identity: {}, Columns: {}", MessageType.RELATION, relationId, replicaIdentityId, columnCount);
         LOGGER.trace("Schema: '{}', Table: '{}'", schemaName, tableName);
 
-        // Perform several out-of-bands database metadata queries
-        Map<String, Optional<String>> columnDefaults;
-        Map<String, Boolean> columnOptionality;
-        List<String> primaryKeyColumns;
-
-        final DatabaseMetaData databaseMetadata = connection.connection().getMetaData();
         final TableId tableId = new TableId(null, schemaName, tableName);
-
-        final List<io.debezium.relational.Column> readColumns = connection.getTableColumnsForDecoder(
-                tableId, decoderContext.getConfig().getColumnFilter());
-        columnDefaults = readColumns.stream()
-                .filter(io.debezium.relational.Column::hasDefaultValue)
-                .collect(toMap(io.debezium.relational.Column::name, io.debezium.relational.Column::defaultValueExpression));
-
-        columnOptionality = readColumns.stream().collect(toMap(io.debezium.relational.Column::name, io.debezium.relational.Column::isOptional));
-        primaryKeyColumns = connection.readPrimaryKeyNames(databaseMetadata, tableId);
-        if (primaryKeyColumns == null || primaryKeyColumns.isEmpty()) {
-            LOGGER.warn("Primary keys are not defined for table '{}', defaulting to unique indices", tableName);
-            primaryKeyColumns = connection.readTableUniqueIndices(databaseMetadata, tableId);
-        }
+        final RelationMetadata metadata = relationMetadata(relationId, relationDefinition, tableId, useCachedMetadata);
+        final Map<String, Optional<String>> columnDefaults = metadata.columnDefaults;
+        final Map<String, Boolean> columnOptionality = metadata.columnOptionality;
+        final List<String> primaryKeyColumns = new ArrayList<>(metadata.primaryKeyColumns);
 
         List<ColumnMetaData> columns = new ArrayList<>();
         Set<String> columnNames = new HashSet<>();
@@ -363,6 +376,138 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
         decoderContext.getSchema().applySchemaChangesForTable(relationId, table);
     }
 
+    /**
+     * Returns the column metadata for a relation message. Every database query costs a network round trip, and the
+     * server repeats an unchanged relation message after each invalidation of the table, so we use the cached result
+     * while the message is the same and the entry is younger than the configured TTL.
+     */
+    private RelationMetadata relationMetadata(int relationId, byte[] relationDefinition, TableId tableId, boolean useCachedMetadata) throws SQLException {
+        if (relationMetadataCacheTtl.isZero()) {
+            return readRelationMetadata(tableId);
+        }
+        final long now = clock.currentTimeInMillis();
+        final CachedRelation cached = relationMetadataCache.get(relationId);
+        if (useCachedMetadata && cached != null && Arrays.equals(cached.relationDefinition, relationDefinition)
+                && now - cached.readAtMillis < relationMetadataCacheTtl.toMillis()) {
+            cached.servedFromCache = true;
+            return cached.metadata;
+        }
+        final RelationMetadata metadata = readRelationMetadata(tableId);
+        relationMetadataCache.put(relationId, new CachedRelation(relationDefinition, metadata, now));
+        return metadata;
+    }
+
+    private RelationMetadata readRelationMetadata(TableId tableId) throws SQLException {
+        // Perform several out-of-bands database metadata queries
+        final DatabaseMetaData databaseMetadata = connection.connection().getMetaData();
+
+        final List<io.debezium.relational.Column> readColumns = connection.getTableColumnsForDecoder(
+                tableId, decoderContext.getConfig().getColumnFilter());
+        final Map<String, Optional<String>> columnDefaults = readColumns.stream()
+                .filter(io.debezium.relational.Column::hasDefaultValue)
+                .collect(toMap(io.debezium.relational.Column::name, io.debezium.relational.Column::defaultValueExpression));
+
+        final Map<String, Boolean> columnOptionality = readColumns.stream()
+                .collect(toMap(io.debezium.relational.Column::name, io.debezium.relational.Column::isOptional));
+        List<String> primaryKeyColumns = connection.readPrimaryKeyNames(databaseMetadata, tableId);
+        if (primaryKeyColumns == null || primaryKeyColumns.isEmpty()) {
+            LOGGER.warn("Primary keys are not defined for table '{}', defaulting to unique indices", tableId.table());
+            primaryKeyColumns = connection.readTableUniqueIndices(databaseMetadata, tableId);
+        }
+        return new RelationMetadata(columnDefaults, columnOptionality, primaryKeyColumns);
+    }
+
+    /**
+     * The cached metadata can mark a column as required after the column became nullable, because DROP NOT NULL does
+     * not change the relation message. The converters replace a null value of a required column with a default, so
+     * before we decode a tuple with such a null we read the metadata from the database and apply the table again.
+     *
+     * @param relationId The relation of the change message
+     * @param table The table resolved for the relation
+     * @param hasNullInRequiredColumn Checks the tuples of the change message against a table
+     * @param typeRegistry The postgres type registry
+     * @return the table to decode the tuples with
+     */
+    private Table refreshTableIfRequiredColumnIsNull(int relationId, Table table, Predicate<Table> hasNullInRequiredColumn, TypeRegistry typeRegistry)
+            throws SQLException {
+        final CachedRelation cached = relationMetadataCache.get(relationId);
+        if (cached == null || !cached.servedFromCache || !hasNullInRequiredColumn.test(table)) {
+            return table;
+        }
+        LOGGER.info("Table '{}' has a null value in a column that the cached metadata marks as required; reading the metadata from the database",
+                table.id());
+        applyRelation(ByteBuffer.wrap(cached.relationDefinition), typeRegistry, false);
+        return resolveRelation(relationId).orElse(table);
+    }
+
+    /**
+     * Checks one tuple of a change message and moves the buffer to the end of the tuple.
+     *
+     * @return {@code true} if the tuple has a null value in a column that the table marks as required
+     */
+    private static boolean tupleHasNullInRequiredColumn(ByteBuffer buffer, Table table) {
+        final List<io.debezium.relational.Column> columns = table.columns();
+        boolean found = false;
+        final short numberOfColumns = buffer.getShort();
+        for (short i = 0; i < numberOfColumns; ++i) {
+            final char type = (char) buffer.get();
+            if (type == 't' || type == 'b') {
+                final int length = buffer.getInt();
+                buffer.position(buffer.position() + length);
+            }
+            else if (type == 'n' && i < columns.size() && !columns.get(i).isOptional()) {
+                found = true;
+            }
+        }
+        return found;
+    }
+
+    /**
+     * Checks the tuples of an update message, starting at the first tuple type byte.
+     *
+     * @return {@code true} if the new tuple or the old tuple has a null value in a column that the table marks as required
+     */
+    private static boolean updateHasNullInRequiredColumn(ByteBuffer buffer, Table table) {
+        final char tupleType = (char) buffer.get();
+        boolean found = false;
+        if ('O' == tupleType || 'K' == tupleType) {
+            // A key tuple ('K') has null in every column outside the replica identity, so only an old tuple ('O') counts.
+            found = tupleHasNullInRequiredColumn(buffer, table) && 'O' == tupleType;
+            // Skip the 'N' tuple type
+            buffer.get();
+        }
+        return tupleHasNullInRequiredColumn(buffer, table) || found;
+    }
+
+    /**
+     * Column metadata of a relation that we read from the database.
+     */
+    private static final class RelationMetadata {
+        private final Map<String, Optional<String>> columnDefaults;
+        private final Map<String, Boolean> columnOptionality;
+        private final List<String> primaryKeyColumns;
+
+        private RelationMetadata(Map<String, Optional<String>> columnDefaults, Map<String, Boolean> columnOptionality, List<String> primaryKeyColumns) {
+            this.columnDefaults = columnDefaults;
+            this.columnOptionality = columnOptionality;
+            this.primaryKeyColumns = primaryKeyColumns;
+        }
+    }
+
+    private static final class CachedRelation {
+        private final byte[] relationDefinition;
+        private final RelationMetadata metadata;
+        private final long readAtMillis;
+        // true when the current table of the relation was built from this entry without a database query
+        private boolean servedFromCache;
+
+        private CachedRelation(byte[] relationDefinition, RelationMetadata metadata, long readAtMillis) {
+            this.relationDefinition = relationDefinition;
+            this.metadata = metadata;
+            this.readAtMillis = readAtMillis;
+        }
+    }
+
     private boolean isColumnInPrimaryKey(String schemaName, String tableName, String columnName, List<String> primaryKeyColumns) {
         // todo (DBZ-766) - Discuss this logic with team as there may be a better way to handle this
         // Personally I think its sufficient enough to resolve the PK based on the out-of-bands call
@@ -408,7 +553,8 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             processor.process(new NoopMessage(transactionId, commitTimestamp, Operation.INSERT));
         }
         else {
-            Table table = resolvedTable.get();
+            Table table = refreshTableIfRequiredColumnIsNull(relationId, resolvedTable.get(),
+                    t -> tupleHasNullInRequiredColumn(buffer.duplicate(), t), typeRegistry);
             List<Column> columns = resolveColumnsFromStreamTupleData(buffer, typeRegistry, table);
             processor.process(new PgOutputReplicationMessage(
                     Operation.INSERT,
@@ -439,7 +585,8 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             processor.process(new NoopMessage(transactionId, commitTimestamp, Operation.UPDATE));
         }
         else {
-            Table table = resolvedTable.get();
+            Table table = refreshTableIfRequiredColumnIsNull(relationId, resolvedTable.get(),
+                    t -> updateHasNullInRequiredColumn(buffer.duplicate(), t), typeRegistry);
 
             // When reading the tuple-type, we could get 3 different values, 'O', 'K', or 'N'.
             // 'O' (Optional) - States the following tuple-data is the key, only for replica identity index configs.
@@ -488,7 +635,9 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             processor.process(new NoopMessage(transactionId, commitTimestamp, Operation.DELETE));
         }
         else {
-            Table table = resolvedTable.get();
+            // A key tuple ('K') has null in every column outside the replica identity, so only an old tuple ('O') is checked.
+            Table table = refreshTableIfRequiredColumnIsNull(relationId, resolvedTable.get(),
+                    t -> tupleType == 'O' && tupleHasNullInRequiredColumn(buffer.duplicate(), t), typeRegistry);
             List<Column> columns = resolveColumnsFromStreamTupleData(buffer, typeRegistry, table);
             processor.process(new PgOutputReplicationMessage(
                     Operation.DELETE,

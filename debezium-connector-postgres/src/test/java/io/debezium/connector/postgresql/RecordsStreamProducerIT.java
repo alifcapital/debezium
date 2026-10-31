@@ -73,6 +73,7 @@ import io.debezium.connector.postgresql.PostgresConnectorConfig.SchemaRefreshMod
 import io.debezium.connector.postgresql.PostgresConnectorConfig.SnapshotMode;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
+import io.debezium.connector.postgresql.connection.pgoutput.PgOutputMessageDecoder;
 import io.debezium.connector.postgresql.junit.SkipTestDependingOnDecoderPluginNameRule;
 import io.debezium.connector.postgresql.junit.SkipWhenDecoderPluginNameIs;
 import io.debezium.connector.postgresql.junit.SkipWhenDecoderPluginNameIsNot;
@@ -4010,6 +4011,44 @@ public class RecordsStreamProducerIT extends AbstractRecordsProducerTest {
         SourceRecord insertedRecord = consumer.remove();
 
         return assertRecordInserted(insertedRecord, expectedTopicName, pkColumn, pk);
+    }
+
+    @Test
+    @SkipWhenDecoderPluginNameIsNot(value = SkipWhenDecoderPluginNameIsNot.DecoderPluginName.PGOUTPUT, reason = "Only pgoutput caches relation metadata")
+    public void shouldEmitNullForColumnMadeNullableWhileRelationMetadataIsCached() throws Exception {
+        TestHelper.execute("CREATE TABLE t0 (pk SERIAL, d INTEGER NOT NULL, PRIMARY KEY(pk));");
+        final LogInterceptor logInterceptor = new LogInterceptor(PgOutputMessageDecoder.class);
+        startConnector(config -> config.with(PostgresConnectorConfig.RELATION_METADATA_CACHE_TTL_MS, 600_000), false);
+        consumer = testConsumer(1);
+
+        executeAndWait("INSERT INTO t0 (pk,d) VALUES (1,1);");
+        Struct after = ((Struct) consumer.remove().value()).getStruct(Envelope.FieldName.AFTER);
+        assertThat(after.getInt32("d")).isEqualTo(1);
+        assertThat(after.schema().field("d").schema().isOptional()).isFalse();
+
+        TestHelper.execute("ANALYZE t0;");
+        consumer.expects(1);
+        executeAndWait("INSERT INTO t0 (pk,d) VALUES (2,2);");
+        after = ((Struct) consumer.remove().value()).getStruct(Envelope.FieldName.AFTER);
+        assertThat(after.getInt32("d")).isEqualTo(2);
+
+        // DROP NOT NULL makes the server send the same relation message again, and the cache answers it.
+        // The connector must not emit the converter default (0) for the null value.
+        TestHelper.execute("ALTER TABLE t0 ALTER COLUMN d DROP NOT NULL;");
+        consumer.expects(1);
+        executeAndWait("INSERT INTO t0 (pk,d) VALUES (3,NULL);");
+        after = ((Struct) consumer.remove().value()).getStruct(Envelope.FieldName.AFTER);
+        assertThat(after.get("d")).isNull();
+        assertThat(after.schema().field("d").schema().isOptional()).isTrue();
+        assertThat(logInterceptor.containsMessage("has a null value in a column that the cached metadata marks as required")).isTrue();
+
+        // A new column changes the relation message, so the cache does not answer it
+        TestHelper.execute("ALTER TABLE t0 ADD COLUMN d2 INTEGER;");
+        consumer.expects(1);
+        executeAndWait("INSERT INTO t0 (pk,d,d2) VALUES (4,4,4);");
+        after = ((Struct) consumer.remove().value()).getStruct(Envelope.FieldName.AFTER);
+        assertThat(after.getInt32("d")).isEqualTo(4);
+        assertThat(after.getInt32("d2")).isEqualTo(4);
     }
 
     private void executeAndWait(String statements) throws Exception {
