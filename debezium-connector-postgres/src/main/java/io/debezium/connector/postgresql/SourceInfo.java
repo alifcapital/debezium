@@ -7,11 +7,6 @@
 package io.debezium.connector.postgresql;
 
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 import io.debezium.annotation.NotThreadSafe;
 import io.debezium.connector.common.BaseSourceInfo;
@@ -83,7 +78,7 @@ public final class SourceInfo extends BaseSourceInfo {
     public static final String MSG_TYPE_KEY = "messageType";
     public static final String LAST_SNAPSHOT_RECORD_KEY = "last_snapshot_record";
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final char[] HEX_DIGITS = "0123456789ABCDEF".toCharArray();
 
     private final String dbName;
 
@@ -175,21 +170,68 @@ public final class SourceInfo extends BaseSourceInfo {
 
     @Override
     public String sequence() {
-        List<String> sequence = new ArrayList<String>(2);
         String lastCommitLsn = (this.lastCommitLsn != null)
                 ? Long.toString(this.lastCommitLsn.asLong())
                 : null;
         String lsn = (this.lsn != null)
                 ? Long.toString(this.lsn.asLong())
                 : null;
-        sequence.add(lastCommitLsn);
-        sequence.add(lsn);
-        try {
-            return MAPPER.writeValueAsString(sequence);
+        // We build this for every event and a JSON library costs more CPU than it is worth here, so we write the array ourselves
+        final StringBuilder sequence = new StringBuilder(48);
+        sequence.append('[');
+        appendJsonString(sequence, lastCommitLsn);
+        sequence.append(',');
+        appendJsonString(sequence, lsn);
+        return sequence.append(']').toString();
+    }
+
+    /**
+     * Appends the value as a JSON string, or as {@code null} if it is null, escaped the same way as Jackson does it.
+     * We expect only digits with an optional minus sign here, which need no escaping, but we fear that other text
+     * is passed one day, so we escape it to keep the result valid JSON.
+     */
+    static void appendJsonString(StringBuilder target, String value) {
+        if (value == null) {
+            target.append("null");
+            return;
         }
-        catch (JsonProcessingException e) {
-            throw new IllegalStateException(e);
+        target.append('"');
+        int unwritten = 0;
+        for (int i = 0; i < value.length(); i++) {
+            final char c = value.charAt(i);
+            if (c >= ' ' && c != '"' && c != '\\') {
+                continue;
+            }
+            target.append(value, unwritten, i);
+            unwritten = i + 1;
+            switch (c) {
+                case '"':
+                    target.append("\\\"");
+                    break;
+                case '\\':
+                    target.append("\\\\");
+                    break;
+                case '\b':
+                    target.append("\\b");
+                    break;
+                case '\t':
+                    target.append("\\t");
+                    break;
+                case '\n':
+                    target.append("\\n");
+                    break;
+                case '\f':
+                    target.append("\\f");
+                    break;
+                case '\r':
+                    target.append("\\r");
+                    break;
+                default:
+                    target.append("\\u00").append(HEX_DIGITS[c >> 4]).append(HEX_DIGITS[c & 0xF]);
+            }
         }
+        target.append(value, unwritten, value.length());
+        target.append('"');
     }
 
     @Override
