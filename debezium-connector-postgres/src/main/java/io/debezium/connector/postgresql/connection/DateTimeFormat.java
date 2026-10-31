@@ -9,8 +9,10 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.Month;
 import java.time.OffsetDateTime;
 import java.time.OffsetTime;
+import java.time.Year;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
@@ -52,6 +54,11 @@ public interface DateTimeFormat {
 
     class ISODateTimeFormat implements DateTimeFormat {
         private static final Logger LOGGER = LoggerFactory.getLogger(ISODateTimeFormat.class);
+
+        private static final int DATE_LENGTH = "YYYY-MM-DD".length();
+        private static final int TIMESTAMP_LENGTH = "YYYY-MM-DD HH:MM:SS".length();
+        private static final int MAX_FRACTION_DIGITS = 9;
+        private static final long SECONDS_PER_DAY = 86_400L;
 
         // This formatter is similar to standard Java's ISO_LOCAL_DATE. But this one is
         // using 'YEAR_OF_ERA + SignStyle.NEVER' instead of 'YEAR+SignStyle.EXCEEDS_PAD'
@@ -134,6 +141,11 @@ public interface DateTimeFormat {
 
         @Override
         public LocalDate date(final String s) {
+            final LocalDate fastValue = parseIsoDate(s);
+            return fastValue != null ? fastValue : dateWithFormatter(s);
+        }
+
+        LocalDate dateWithFormatter(final String s) {
             return format(DATE_FORMAT_OPT_ERA_PATTERN_HINT, s, () -> {
                 if ("infinity".equals(s)) {
                     return PostgresValueConverter.POSITIVE_INFINITY_LOCAL_DATE;
@@ -169,6 +181,11 @@ public interface DateTimeFormat {
 
         @Override
         public Instant timestampToInstant(String s) {
+            final Instant fastValue = parseIsoTimestamp(s);
+            return fastValue != null ? fastValue : timestampToInstantWithFormatter(s);
+        }
+
+        Instant timestampToInstantWithFormatter(String s) {
             return format(TS_FORMAT_PATTERN_HINT, s, () -> LocalDateTime.from(TS_FORMAT.parse(s)).toInstant(ZoneOffset.UTC));
         }
 
@@ -194,6 +211,92 @@ public interface DateTimeFormat {
         @Override
         public Instant systemTimestampToInstant(String s) {
             return format(SYSTEM_TS_FORMAT_PATTERN_HINT, s, () -> OffsetDateTime.from(SYSTEM_TS_FORMAT.parse(s)).toInstant());
+        }
+
+        // Parsing each value with the formatter is slow and it runs for every date and timestamp column.
+        // We fear that the formatter also accepts or fixes up inputs in its own way (for example it moves
+        // 2023-02-30 to 2023-02-28), so we only take the plain valid form here and return null for anything
+        // else. The caller then uses the formatter, which gives the same value or the same exception.
+        static LocalDate parseIsoDate(final String s) {
+            if (s == null || s.length() != DATE_LENGTH) {
+                return null;
+            }
+            return parsePlainDate(s);
+        }
+
+        // Accepts YYYY-MM-DD HH:MM:SS with an optional dot and 1 to 9 fraction digits, read as UTC.
+        static Instant parseIsoTimestamp(final String s) {
+            if (s == null) {
+                return null;
+            }
+            final int length = s.length();
+            // A dot must be followed by at least one digit, so the length 20 is not possible
+            if (length < TIMESTAMP_LENGTH || length == TIMESTAMP_LENGTH + 1 || length > TIMESTAMP_LENGTH + 1 + MAX_FRACTION_DIGITS) {
+                return null;
+            }
+            if (s.charAt(10) != ' ' || s.charAt(13) != ':' || s.charAt(16) != ':') {
+                return null;
+            }
+
+            final LocalDate date = parsePlainDate(s);
+            final int hour = twoDigits(s, 11);
+            final int minute = twoDigits(s, 14);
+            final int second = twoDigits(s, 17);
+            // The formatter also accepts 24:00:00 as the end of the day, we leave that to it
+            if (date == null || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+                return null;
+            }
+
+            int nanos = 0;
+            if (length > TIMESTAMP_LENGTH) {
+                if (s.charAt(TIMESTAMP_LENGTH) != '.') {
+                    return null;
+                }
+                int digits = 0;
+                for (int i = TIMESTAMP_LENGTH + 1; i < length; i++) {
+                    final int digit = s.charAt(i) - '0';
+                    if (digit < 0 || digit > 9) {
+                        return null;
+                    }
+                    nanos = nanos * 10 + digit;
+                    digits++;
+                }
+                for (; digits < MAX_FRACTION_DIGITS; digits++) {
+                    nanos *= 10;
+                }
+            }
+
+            final long epochSecond = date.toEpochDay() * SECONDS_PER_DAY + hour * 3600 + minute * 60 + second;
+            return Instant.ofEpochSecond(epochSecond, nanos);
+        }
+
+        // Reads the YYYY-MM-DD at the start of the string, which must be at least 10 characters long.
+        private static LocalDate parsePlainDate(final String s) {
+            if (s.charAt(4) != '-' || s.charAt(7) != '-') {
+                return null;
+            }
+            final int yearHigh = twoDigits(s, 0);
+            final int yearLow = twoDigits(s, 2);
+            final int month = twoDigits(s, 5);
+            final int day = twoDigits(s, 8);
+            if (yearHigh < 0 || yearLow < 0 || month < 1 || month > 12 || day < 1) {
+                return null;
+            }
+            final int year = yearHigh * 100 + yearLow;
+            if (year < 1 || day > Month.of(month).length(Year.isLeap(year))) {
+                return null;
+            }
+            return LocalDate.of(year, month, day);
+        }
+
+        // Returns -1 if one of the two characters is not an ASCII digit.
+        private static int twoDigits(final String s, final int position) {
+            final int tens = s.charAt(position) - '0';
+            final int ones = s.charAt(position + 1) - '0';
+            if (tens < 0 || tens > 9 || ones < 0 || ones > 9) {
+                return -1;
+            }
+            return tens * 10 + ones;
         }
     }
 }
